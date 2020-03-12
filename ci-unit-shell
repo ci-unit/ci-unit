@@ -1,0 +1,98 @@
+#!/bin/bash
+# Provides a shell wrapper to be used as an entrypoint for CI that generates
+# JUnit XML files for each CI step to allow for external tool ingestion.
+
+timestamp() {
+  date +"%s"
+}
+
+# configurable constants
+CI_UNIT_OUT_CONTEXT="${CI_UNIT_OUT_CONTEXT:-20}"
+CI_UNIT_OUT_DIR="${CI_UNIT_OUT_DIR:-/tmp/ci-unit}"
+CI_UNIT_SHELL="${CI_UNIT_SHELL:-/bin/bash}"
+CI_UNIT_VERBOSE="${CI_UNIT_VERBOSE:-0}"
+
+# constants
+VERSION="0.1.0"
+COUNT_FILE=/tmp/ci-unit.count
+OUT_FILE=/tmp/ci-unit.out
+
+# initialize and increment count file
+if [ -e "$COUNT_FILE" ] ; then
+  # tr is only needed to be compatible with silly wc implementations like OSX
+  count="$(wc -l < "$COUNT_FILE" | tr -d '[:space:]')"
+else
+  count=0
+fi
+echo >> "$COUNT_FILE"
+
+if [ $CI_UNIT_VERBOSE != "0" ] ; then
+  # print configuration
+  echo "ci-unit: initialized $VERSION"
+  ( set -o posix ; set ) | grep ^SHELL_XUNIT | sed -e 's/^/- /'
+  echo "ci-unit: count = $count"
+  echo "-------------------"
+fi
+
+# execute commands in desired subshell and track result
+set -o pipefail # needed to ensure tee does not clobber subshell exit status
+start="$(timestamp)"
+$CI_UNIT_SHELL -eo pipefail "$@" 2>&1 | tee "$OUT_FILE"
+result=$?
+stop="$(timestamp)"
+
+if [ $result -eq 0 ] ; then
+  failed=0
+else
+  failed=1
+fi
+
+# evaluate summary variables
+if [ ! -z ${CIRCLECI+x} ] ; then
+  CI_TYPE="CircleCI"
+  CI_JOB="$CIRCLE_JOB"
+  CI_JOB_NUM="$CIRCLE_BUILD_NUM"
+  # TODO read in .circleci/config.yml to determine step name/summary, but
+  # skipped for now to avoid extra dependencies in images
+  CI_STEP="Step $count"
+else
+  CI_TYPE="unkown"
+  CI_JOB="unkown"
+  CI_JOB_NUM="$(timestamp)"
+  CI_STEP="unknown"
+fi
+
+delta="$(($stop - $start))"
+timestamp="$(date +%Y-%m-%dT%H:%M:%S)"
+
+# generate xunit file summarizing shell execution
+if [ ! -e "$CI_UNIT_OUT_DIR" ] ; then
+  mkdir -p "$CI_UNIT_OUT_DIR"
+fi
+
+xunit_file="$CI_UNIT_OUT_DIR/$CI_TYPE-$CI_JOB-$count-$CI_JOB_NUM.xml"
+cat > "$xunit_file" <<- EOM
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="$CI_TYPE Job Steps" time="$delta" tests="1" failures="$failed">
+  <testsuite name="$CI_TYPE.$CI_JOB" timestamp="$timestamp" tests="1" failures="$failed" time="$delta">
+    <testcase name="Step $count" time="$delta" classname="$CI_TYPE.$CI_JOB.$count">
+EOM
+
+if [ $failed -eq 1 ] ; then
+  message="$(tail -n "$CI_UNIT_OUT_CONTEXT" "$OUT_FILE")"
+  echo "      <failure><![CDATA[$message]]></failure>" >> "$xunit_file"
+fi
+
+cat >> "$xunit_file" <<- EOM
+    </testcase>
+  </testsuite>
+</testsuites>
+EOM
+
+if [ $CI_UNIT_VERBOSE != "0" ] ; then
+  echo "-------------------"
+  echo "ci-unit: complete; spent $delta second(s) with result of $result ; generated $xunit_file"
+  cat "$xunit_file"
+fi
+
+exit $failed
